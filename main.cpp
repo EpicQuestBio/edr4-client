@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -10,6 +11,8 @@
 #include <memory>
 #include <sstream>
 #include <atomic>
+#include <functional>
+#include <cctype>
 
 #define NOMINMAX
 #include <winsock2.h>
@@ -25,13 +28,11 @@ using namespace er4CommLib;
 
 struct SampleFrame {
     uint64_t tMs = 0;
-    std::string source;       // "sim" or "e4"
+    std::string source;
     unsigned int sampleCount = 0;
     double minCurrent = 0.0;
     double maxCurrent = 0.0;
     double meanCurrent = 0.0;
-
-    // Optional lightweight payload for graphing (decimated)
     std::vector<double> currentPreview;
 };
 
@@ -61,15 +62,90 @@ static std::string frameToJsonLine(const SampleFrame& f) {
     return oss.str();
 }
 
-// ========================= TCP JSONL sender =========================
-
-class TcpJsonlSink {
-public:
-    TcpJsonlSink(std::string host, uint16_t port)
-        : host_(std::move(host)), port_(port) {
+static std::string escapeJson(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default: out += c; break;
+        }
     }
+    return out;
+}
 
-    ~TcpJsonlSink() {
+// ========================= Tiny JSON helpers =========================
+
+static bool findJsonString(const std::string& json, const std::string& key, std::string& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + needle.size());
+    if (p == std::string::npos) return false;
+    p = json.find('"', p);
+    if (p == std::string::npos) return false;
+    ++p;
+
+    std::string value;
+    bool escape = false;
+    for (; p < json.size(); ++p) {
+        char c = json[p];
+        if (escape) {
+            value.push_back(c);
+            escape = false;
+        } else if (c == '\\') {
+            escape = true;
+        } else if (c == '"') {
+            out = value;
+            return true;
+        } else {
+            value.push_back(c);
+        }
+    }
+    return false;
+}
+
+static bool findJsonInt(const std::string& json, const std::string& key, int& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + needle.size());
+    if (p == std::string::npos) return false;
+    ++p;
+    while (p < json.size() && std::isspace((unsigned char)json[p])) ++p;
+
+    size_t start = p;
+    if (p < json.size() && (json[p] == '-' || json[p] == '+')) ++p;
+    while (p < json.size() && std::isdigit((unsigned char)json[p])) ++p;
+    if (p == start || (p == start + 1 && (json[start] == '-' || json[start] == '+'))) return false;
+
+    try {
+        out = std::stoi(json.substr(start, p - start));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string mapVoltagePresetToSettingString(const std::string& preset) {
+    if (preset == "negative") return "-1";
+    if (preset == "neutral") return "0";
+    if (preset == "positive") return "1";
+    return "";
+}
+
+// ========================= TCP JSONL client =========================
+
+class TcpJsonlClient {
+public:
+    TcpJsonlClient(std::string host, uint16_t port)
+        : host_(std::move(host)), port_(port) {}
+
+    ~TcpJsonlClient() {
         close();
         cleanupWinsock();
     }
@@ -90,7 +166,7 @@ public:
         if (sock_ != INVALID_SOCKET) return true;
         if (!init()) return false;
 
-        struct addrinfo hints {};
+        struct addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
@@ -118,12 +194,12 @@ public:
         freeaddrinfo(result);
 
         if (s == INVALID_SOCKET) {
-            // Not fatal: server may not be up yet.
             return false;
         }
 
         sock_ = s;
-        std::cout << "Connected to Python server at " << host_ << ":" << port_ << "\n";
+        recvBuffer_.clear();
+        std::cout << "Connected to server at " << host_ << ":" << port_ << "\n";
         return true;
     }
 
@@ -134,7 +210,7 @@ public:
         while (total < len) {
             int sent = send(sock_, line.data() + total, len - total, 0);
             if (sent == SOCKET_ERROR) {
-                std::cerr << "Socket send failed. Disconnecting sink.\n";
+                std::cerr << "Socket send failed. Disconnecting client.\n";
                 close();
                 return false;
             }
@@ -143,11 +219,53 @@ public:
         return true;
     }
 
+    void pollIncomingLines(const std::function<void(const std::string&)>& handler) {
+        if (sock_ == INVALID_SOCKET) return;
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock_, &readfds);
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+
+        int ready = select(0, &readfds, nullptr, nullptr, &tv);
+        if (ready == SOCKET_ERROR) {
+            std::cerr << "select() failed; disconnecting client.\n";
+            close();
+            return;
+        }
+        if (ready == 0 || !FD_ISSET(sock_, &readfds)) return;
+
+        char buf[4096];
+        int n = recv(sock_, buf, sizeof(buf), 0);
+        if (n == 0) {
+            std::cerr << "Server closed connection.\n";
+            close();
+            return;
+        }
+        if (n == SOCKET_ERROR) {
+            std::cerr << "recv() failed; disconnecting client.\n";
+            close();
+            return;
+        }
+
+        recvBuffer_.append(buf, n);
+
+        size_t pos = 0;
+        while ((pos = recvBuffer_.find('\n')) != std::string::npos) {
+            std::string line = recvBuffer_.substr(0, pos);
+            recvBuffer_.erase(0, pos + 1);
+            if (!line.empty()) handler(line);
+        }
+    }
+
     void close() {
         if (sock_ != INVALID_SOCKET) {
             closesocket(sock_);
             sock_ = INVALID_SOCKET;
         }
+        recvBuffer_.clear();
     }
 
 private:
@@ -162,6 +280,7 @@ private:
     uint16_t port_ = 0;
     SOCKET sock_ = INVALID_SOCKET;
     bool winsockInit_ = false;
+    std::string recvBuffer_;
 };
 
 // ========================= Data source abstraction =========================
@@ -170,9 +289,12 @@ class IDataSource {
 public:
     virtual ~IDataSource() = default;
     virtual bool start() = 0;
-    virtual bool readFrame(SampleFrame& outFrame) = 0; // blocking-ish / paced
+    virtual bool readFrame(SampleFrame& outFrame) = 0;
     virtual void stop() = 0;
     virtual std::string name() const = 0;
+
+    virtual bool applyVoltageSetting(int setting, std::string& message) = 0;
+    virtual bool triggerZapper(std::string& message) = 0;
 };
 
 // ========================= Simulation source =========================
@@ -180,12 +302,12 @@ public:
 class SimSource : public IDataSource {
 public:
     SimSource(unsigned int samplesPerFrame = 64, int frameMs = 50)
-        : samplesPerFrame_(samplesPerFrame), frameMs_(frameMs), rng_(std::random_device{}()) {
-    }
+        : samplesPerFrame_(samplesPerFrame), frameMs_(frameMs), rng_(std::random_device{}()) {}
 
     bool start() override {
         running_ = true;
         phase_ = 0.0;
+        simulatedVoltageSetting_ = 0;
         return true;
     }
 
@@ -201,6 +323,9 @@ public:
         int spikeLen = 3 + (rng_() % 8);
         double spike = (rng_() % 2 == 0 ? 1.0 : -1.0) * spikeAmp(rng_);
 
+        // Use voltage setting to slightly bias the simulated waveform.
+        double bias = 0.18 * (double)simulatedVoltageSetting_;
+
         out = {};
         out.tMs = nowMs();
         out.source = "sim";
@@ -211,7 +336,7 @@ public:
 
         double sum = 0.0;
         for (unsigned int i = 0; i < samplesPerFrame_; ++i) {
-            double x = std::sin(phase_) * 0.6 + std::sin(phase_ * 0.17) * 0.15 + noise(rng_);
+            double x = std::sin(phase_) * 0.6 + std::sin(phase_ * 0.17) * 0.15 + noise(rng_) + bias;
             if (doSpike && i >= (unsigned int)spikeStart && i < (unsigned int)(spikeStart + spikeLen)) {
                 x += spike;
             }
@@ -231,12 +356,26 @@ public:
     void stop() override { running_ = false; }
     std::string name() const override { return "SimSource"; }
 
+    bool applyVoltageSetting(int setting, std::string& message) override {
+        simulatedVoltageSetting_ = setting;
+        std::ostringstream oss;
+        oss << "Simulated voltage setting applied: " << setting;
+        message = oss.str();
+        return true;
+    }
+
+    bool triggerZapper(std::string& message) override {
+        message = "Simulated zap triggered";
+        return true;
+    }
+
 private:
     unsigned int samplesPerFrame_;
     int frameMs_;
     std::mt19937 rng_;
     double phase_ = 0.0;
-    std::atomic<bool> running_{ false };
+    int simulatedVoltageSetting_ = 0;
+    std::atomic<bool> running_{false};
 };
 
 // ========================= E4 source =========================
@@ -246,7 +385,6 @@ public:
     explicit E4Source(int idleSleepMs = 10) : idleSleepMs_(idleSleepMs) {}
 
     bool start() override {
-        // Detect + connect
         ErrorCodes_t detectError = detectDevices(deviceIds_);
         if (detectError != Success || deviceIds_.empty()) {
             return false;
@@ -269,8 +407,8 @@ public:
         }
 
         std::cout << "E4 connected. V=" << voltageChannelsNum_
-            << " I=" << currentChannelsNum_
-            << " GP=" << gpChannelsNum_ << "\n";
+                  << " I=" << currentChannelsNum_
+                  << " GP=" << gpChannelsNum_ << "\n";
 
         if (currentChannelsNum_ == 0) {
             std::cerr << "No current channels on E4.\n";
@@ -318,7 +456,6 @@ public:
         out.minCurrent = 1e9;
         out.maxCurrent = -1e9;
 
-        // Keep a decimated preview to avoid huge JSON payloads
         unsigned int previewTarget = 64;
         unsigned int step = std::max(1u, dataRead / previewTarget);
 
@@ -327,7 +464,7 @@ public:
 
         for (unsigned int p = 0; p < dataRead; ++p) {
             unsigned int base = p * stride;
-            unsigned int currIdx = base + voltageChannelsNum_; // current channel 0
+            unsigned int currIdx = base + voltageChannelsNum_;
             double currentVal = 0.0;
             ErrorCodes_t cv = convertCurrentValue(buffer[currIdx], 0, currentVal);
             if (cv != Success) continue;
@@ -356,11 +493,91 @@ public:
 
     std::string name() const override { return "E4Source"; }
 
+    bool applyVoltageSetting(int setting, std::string& message) override {
+        if (!running_) {
+            message = "E4 not connected";
+            return false;
+        }
+
+        const int milliVolts = (setting < 0) ? -500 : (setting > 0 ? 500 : 0);
+        Measurement_t v{};
+        v.value = (double)milliVolts;
+        v.prefix = UnitPfxMilli;
+        v.unit = "V";
+
+        std::string validationMessage;
+        ErrorCodes_t last = Success;
+
+        for (uint32_t ch = 0; ch < currentChannelsNum_; ++ch) {
+            validationMessage.clear();
+            last = checkVoltageOffset(ch, v, validationMessage);
+            if (last != Success) {
+                std::ostringstream oss;
+                oss << "Voltage setting rejected on channel " << ch
+                    << " (setting=" << setting << ", " << milliVolts << " mV)"
+                    << ". checkVoltageOffset returned " << (int)last;
+                if (!validationMessage.empty()) oss << ": " << validationMessage;
+                message = oss.str();
+                return false;
+            }
+
+            last = setVoltageOffset(ch, v);
+            if (last != Success) {
+                std::ostringstream oss;
+                oss << "setVoltageOffset failed on channel " << ch
+                    << " with error " << (int)last;
+                message = oss.str();
+                return false;
+            }
+        }
+
+        std::ostringstream oss;
+        oss << "Applied E4 voltage setting " << setting
+            << " => " << milliVolts << " mV on " << currentChannelsNum_ << " channel(s)";
+        message = oss.str();
+        return true;
+    }
+
+    bool triggerZapper(std::string& message) override {
+        if (!running_) {
+            message = "E4 not connected";
+            return false;
+        }
+
+        bool zappable = false;
+        bool singleChannelZap = false;
+        ErrorCodes_t hz = hasZap(zappable, singleChannelZap);
+        if (hz != Success) {
+            std::ostringstream oss;
+            oss << "hasZap failed with error " << (int)hz;
+            message = oss.str();
+            return false;
+        }
+        if (!zappable) {
+            message = "Device reports zap feature unavailable";
+            return false;
+        }
+
+        const uint16_t allChannelsIndex = (uint16_t)currentChannelsNum_;
+        ErrorCodes_t ret = zap(allChannelsIndex);
+        if (ret != Success) {
+            std::ostringstream oss;
+            oss << "zap(" << allChannelsIndex << ") failed with error " << (int)ret;
+            message = oss.str();
+            return false;
+        }
+
+        std::ostringstream oss;
+        oss << "Triggered E4 zap on all channels"
+            << " (singleChannelZap=" << (singleChannelZap ? "true" : "false") << ")";
+        message = oss.str();
+        return true;
+    }
+
     ~E4Source() override { stop(); }
 
 private:
     void bestEffortConfigure() {
-        // Current range
         std::vector<RangedMeasurement_t> currentRanges;
         std::vector<uint16_t> currentRangeDefaults;
         if (getCurrentRanges(currentRanges, currentRangeDefaults) == Success && !currentRanges.empty()) {
@@ -368,21 +585,18 @@ private:
             setCurrentRange(idx);
         }
 
-        // Sampling rate
         std::vector<Measurement_t> samplingRates;
         uint16_t defaultSampling = 0;
         if (getSamplingRates(samplingRates, defaultSampling) == Success && !samplingRates.empty()) {
-            setSamplingRate(0); // vendor sample uses 0 == 1.25kHz
+            setSamplingRate(0);
         }
 
-        // Short offset comp
         if (currentChannelsNum_ > 0) {
             digitalOffsetCompensation(currentChannelsNum_, true);
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             digitalOffsetCompensation(currentChannelsNum_, false);
         }
 
-        // Try starting a protocol so data flows
         std::vector<std::string> names, images;
         std::vector<std::vector<uint16_t>> voltages, times, slopes, frequencies, adims;
         if (getProtocolList(names, images, voltages, times, slopes, frequencies, adims) == Success &&
@@ -395,7 +609,7 @@ private:
     }
 
     int idleSleepMs_;
-    std::atomic<bool> running_{ false };
+    std::atomic<bool> running_{false};
 
     std::vector<std::string> deviceIds_;
     uint32_t voltageChannelsNum_ = 0;
@@ -403,11 +617,113 @@ private:
     uint32_t gpChannelsNum_ = 0;
 };
 
+// ========================= Command handling =========================
+
+static void sendAck(TcpJsonlClient& client,
+                    const std::string& action,
+                    bool ok,
+                    const std::string& message,
+                    const std::string& rawLine) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"type\":\"device_ack\",";
+    oss << "\"action\":\"" << escapeJson(action) << "\",";
+    oss << "\"ok\":" << (ok ? "true" : "false") << ",";
+    oss << "\"message\":\"" << escapeJson(message) << "\",";
+    oss << "\"raw\":\"" << escapeJson(rawLine) << "\"";
+    oss << "}\n";
+    client.sendLine(oss.str());
+}
+
+static void handleIncomingCommandLine(const std::string& line, IDataSource& source, TcpJsonlClient& client) {
+    std::cout << "[recv] " << line << "\n";
+
+    std::string type;
+    findJsonString(line, "type", type);
+
+    // Future-proof: support either browser-style control_intent or server-style device_command.
+    if (type == "control_intent") {
+        std::string intent;
+        if (!findJsonString(line, "intent", intent)) {
+            sendAck(client, "control_intent", false, "Missing intent field", line);
+            return;
+        }
+
+        if (intent == "set_voltage_setting") {
+            int value = 0;
+            if (!findJsonInt(line, "value", value)) {
+                sendAck(client, intent, false, "Missing integer params.value", line);
+                return;
+            }
+
+            std::string msg;
+            bool ok = source.applyVoltageSetting(value, msg);
+            std::cout << "[apply] " << msg << "\n";
+            sendAck(client, intent, ok, msg, line);
+            return;
+        }
+
+        if (intent == "trigger_zapper") {
+            std::string msg;
+            bool ok = source.triggerZapper(msg);
+            std::cout << "[apply] " << msg << "\n";
+            sendAck(client, intent, ok, msg, line);
+            return;
+        }
+
+        sendAck(client, intent, false, "Unsupported control intent", line);
+        return;
+    }
+
+    if (type == "device_command") {
+        std::string command;
+        if (!findJsonString(line, "command", command)) {
+            sendAck(client, "device_command", false, "Missing command field", line);
+            return;
+        }
+
+        if (command == "apply_voltage_preset") {
+            std::string preset;
+            if (!findJsonString(line, "preset", preset)) {
+                sendAck(client, command, false, "Missing args.preset", line);
+                return;
+            }
+
+            std::string mapped = mapVoltagePresetToSettingString(preset);
+            if (mapped.empty()) {
+                sendAck(client, command, false, "Unsupported preset value", line);
+                return;
+            }
+
+            int value = std::stoi(mapped);
+            std::string msg;
+            bool ok = source.applyVoltageSetting(value, msg);
+            std::cout << "[apply] " << msg << "\n";
+            sendAck(client, command, ok, msg, line);
+            return;
+        }
+
+        if (command == "trigger_zap_preset") {
+            std::string msg;
+            bool ok = source.triggerZapper(msg);
+            std::cout << "[apply] " << msg << "\n";
+            sendAck(client, command, ok, msg, line);
+            return;
+        }
+
+        sendAck(client, command, false, "Unsupported device command", line);
+        return;
+    }
+
+    // Always log every command-like line, even if unsupported.
+    sendAck(client, type.empty() ? "unknown" : type, false, "Ignored message type", line);
+}
+
 // ========================= Main =========================
 
 struct Args {
     bool forceSim = false;
-    int seconds = 0; // 0 => run forever
+    int seconds = 0;
     std::string host = "127.0.0.1";
     uint16_t port = 8765;
 };
@@ -418,26 +734,26 @@ static Args parseArgs(int argc, char** argv) {
         std::string s = argv[i];
         if (s == "--simulate") {
             a.forceSim = true;
-        }
-        else if (s.rfind("--seconds=", 0) == 0) {
+        } else if (s.rfind("--seconds=", 0) == 0) {
             a.seconds = std::max(0, std::stoi(s.substr(10)));
-        }
-        else if (s.rfind("--host=", 0) == 0) {
+        } else if (s.rfind("--host=", 0) == 0) {
             a.host = s.substr(7);
-        }
-        else if (s.rfind("--port=", 0) == 0) {
+        } else if (s.rfind("--port=", 0) == 0) {
             int p = std::stoi(s.substr(7));
-            a.port = (uint16_t)std::clamp(p, 1, 65535);
+            if (p < 1) p = 1;
+            if (p > 65535) p = 65535;
+            a.port = (uint16_t)p;
         }
     }
     return a;
 }
 
 static void printBanner(const Args& args) {
-    std::cout << "mq_e4_client v2 (prototype)\n";
+    std::cout << "mq_e4_client v3 (stream + receive commands)\n";
     std::cout << "  server: " << args.host << ":" << args.port << "\n";
     std::cout << "  mode:   " << (args.forceSim ? "SIM ONLY" : "AUTO (E4 -> SIM fallback)") << "\n";
     std::cout << "  run:    " << (args.seconds > 0 ? std::to_string(args.seconds) + "s" : "forever") << "\n";
+    std::cout << "  controls supported: set_voltage_setting, trigger_zapper\n";
 }
 
 int main(int argc, char** argv) {
@@ -449,8 +765,7 @@ int main(int argc, char** argv) {
         auto e4 = std::make_unique<E4Source>();
         if (e4->start()) {
             source = std::move(e4);
-        }
-        else {
+        } else {
             std::cout << "No E4 detected / init failed. Falling back to simulation.\n";
         }
     }
@@ -463,7 +778,7 @@ int main(int argc, char** argv) {
         source = std::move(sim);
     }
 
-    TcpJsonlSink sink(args.host, args.port);
+    TcpJsonlClient client(args.host, args.port);
 
     auto start = std::chrono::steady_clock::now();
     uint64_t sentCount = 0;
@@ -477,37 +792,41 @@ int main(int argc, char** argv) {
                 if (elapsed >= args.seconds) break;
             }
 
+            client.pollIncomingLines([&](const std::string& line) {
+                handleIncomingCommandLine(line, *source, client);
+            });
+
             SampleFrame frame;
             if (!source->readFrame(frame)) {
-                continue; // E4 path may occasionally have no data yet
+                continue;
             }
 
             std::string line = frameToJsonLine(frame);
-            bool sent = sink.sendLine(line);
+            bool sent = client.sendLine(line);
 
             if (sent) {
                 ++sentCount;
-            }
-            else {
+            } else {
                 ++localOnlyCount;
-                // Fallback to stdout so you can still see activity if server isn't running
                 std::cout << line;
             }
 
-            // Optional periodic status
+            client.pollIncomingLines([&](const std::string& incoming) {
+                handleIncomingCommandLine(incoming, *source, client);
+            });
+
             if ((sentCount + localOnlyCount) % 100 == 0) {
                 std::cerr << "[status] source=" << source->name()
-                    << " sent=" << sentCount
-                    << " local_only=" << localOnlyCount << "\n";
+                          << " sent=" << sentCount
+                          << " local_only=" << localOnlyCount << "\n";
             }
         }
-    }
-    catch (const std::exception& ex) {
+    } catch (const std::exception& ex) {
         std::cerr << "Fatal exception: " << ex.what() << "\n";
     }
 
     source->stop();
-    sink.close();
+    client.close();
 
     std::cout << "Done. sent=" << sentCount << " local_only=" << localOnlyCount << "\n";
     return 0;
